@@ -1,23 +1,17 @@
 """
-SecureChat server (practice skeleton, spec-aligned up to login).
+SecureChat server (practice skeleton, spec-aligned, with basic chat receive).
 
 Phases implemented:
 
 1) Plain TCP listen/accept
 2) Control plane:
    - Client sends:  {"type":"hello", "client cert":"...PEM...", "nonce": base64}
-   - Server replies:{"type":"server hello", "server cert":"...PEM...", "nonce": base64}
+   - Server replies{"type":"server hello", "server cert":"...PEM...", "nonce": base64}
    - Server validates client cert (CA, validity, CN)
 3) DH #1: temporary K_cred for protecting credentials
-   - Client -> Server: {"type":"dh client", "g":int, "p":int, "A":int}
-   - Server -> Client: {"type":"dh server", "B":int}
-   - Both derive AES-128 key K_cred = Trunc16(SHA256(shared_secret))
 4) Encrypted register OR login (credentials protected by K_cred)
-   - For simplicity, wire format:
-       {"type":"register", "ct": base64(AES-128(JSON{email,username,password}))}
-       {"type":"login",    "ct": base64(AES-128(JSON{email,password}))}
-   - Server decrypts, calls db.create_user / db.verify_user
-5) DH #2: session key K_session (not used further in this skeleton)
+5) DH #2: session key K_session for chat
+6) Chat: server RECEIVES encrypted+signed messages from client, verifies and logs them
 """
 
 from __future__ import annotations
@@ -36,22 +30,22 @@ from app.common.protocol import (
     ServerHello,
     DhClient,
     DhServer,
+    Msg,
     parse_message,
 )
 from app.common.utils import b64e, b64d
 from app.crypto import pki
-from app.crypto.dh import (
-    generate_dh_keypair_from_params,
-    derive_aes_key,
-)
-from app.crypto.aes import aes_encrypt_ecb, aes_decrypt_ecb
+from app.crypto.dh import generate_dh_keypair_from_params, derive_aes_key
+from app.crypto.aes import aes_decrypt_ecb
+from app.crypto.sign import rsa_verify
 from app.storage import db
+from app.storage.transcript import Transcript
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-load_dotenv()
 
 SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "5000"))
@@ -71,7 +65,7 @@ def send_json(sock: socket.socket, obj: Any) -> None:
     Send a JSON object followed by a newline.
 
     If `obj` is a Pydantic model, we serialize with aliases so that JSON keys
-    like "client cert" / "server cert" match the spec exactly.
+    match the protocol spec exactly where aliases are defined.
     """
     if hasattr(obj, "dict"):
         payload = obj.dict(by_alias=True)
@@ -99,21 +93,34 @@ def recv_json(sock: socket.socket) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Helper: build canonical bytes to sign/verify for Msg
+# ---------------------------------------------------------------------------
+
+
+def build_msg_bytes(seqno: int, ts: int, ct_b64: str) -> bytes:
+    """
+    Build canonical byte string for signing/verifying a Msg:
+
+        data = seqno(8B big-endian) || ts(8B big-endian) || ciphertext_bytes
+
+    This is what we feed to RSA+SHA256.
+    """
+    ct = b64d(ct_b64)
+    seq_bytes = seqno.to_bytes(8, "big", signed=False)
+    ts_bytes = ts.to_bytes(8, "big", signed=False)
+    return seq_bytes + ts_bytes + ct
+
+
+# ---------------------------------------------------------------------------
 # Phase 1: hello / server hello + PKI validation
 # ---------------------------------------------------------------------------
 
 
 def do_cert_handshake(sock: socket.socket) -> Hello:
     """
-    Server side of hello / server hello:
+    Server side of hello / server hello.
 
-    Client -> Server:
-      {"type":"hello", "client cert":"...PEM...", "nonce": base64}
-
-    Server -> Client:
-      {"type":"server hello", "server cert":"...PEM...", "nonce": base64}
-
-    Returns the parsed Hello model so caller can inspect if needed.
+    Returns the parsed Hello model so caller can get client_cert.
     """
     # 1) Receive hello
     raw = recv_json(sock)
@@ -146,19 +153,13 @@ def do_cert_handshake(sock: socket.socket) -> Hello:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: DH handshake -> AES key
+# Phase 2: DH handshake -> AES key (server side)
 # ---------------------------------------------------------------------------
 
 
 def dh_handshake_server(sock: socket.socket) -> bytes:
     """
     Classical DH from server perspective.
-
-    Client -> Server:
-        {"type":"dh client", "g": int, "p": int, "A": int}
-
-    Server -> Client:
-        {"type":"dh server", "B": int}
 
     Returns:
         16-byte AES key derived from shared secret.
@@ -172,8 +173,8 @@ def dh_handshake_server(sock: socket.socket) -> bytes:
     server_kp = generate_dh_keypair_from_params(msg.p, msg.g)
 
     # Compute shared secret and derive AES-128 key
-    shared_secret, aes_key = derive_aes_key(server_kp, peer_y=msg.A, key_len=16)
-    print("[DH] Shared secret established, AES-128 key derived.")
+    _, aes_key = derive_aes_key(server_kp, peer_y=msg.A, key_len=16)
+    print("[DH] Shared secret established, AES-128 key derived (server).")
 
     # Reply with our public B
     dh_server = DhServer(B=server_kp.y)
@@ -258,28 +259,113 @@ def handle_login_message(
 
 
 # ---------------------------------------------------------------------------
+# Phase 4: chat loop (server-side receive only)
+# ---------------------------------------------------------------------------
+
+
+def chat_loop_server(
+    sock: socket.socket,
+    session_key: bytes,
+    client_cert_pem: str,
+) -> None:
+    """
+    Receive encrypted + signed Msgs from client, verify, decrypt, and log.
+
+    Wire format (from client):
+
+      {
+        "type": "msg",
+        "seqno": n,
+        "ts": unix_ms,
+        "ct": base64,
+        "sig": base64
+      }
+
+    - Verifies signatures using client's certificate.
+    - Enforces increasing seqno (simple replay defense).
+    - Logs to transcript (append-only).
+    """
+    # Build x509 cert object from PEM for rsa_verify
+    client_cert = pki.load_cert_from_pem(client_cert_pem.encode("utf-8"))
+
+    transcript = Transcript.new(role="server")
+    last_seq = 0
+
+    print("[CHAT] Ready to receive messages from client. Waiting...")
+
+    while True:
+        try:
+            raw = recv_json(sock)
+        except ConnectionError:
+            print("[CHAT] Client disconnected.")
+            break
+
+        msg_type = raw.get("type")
+
+        if msg_type == "bye":
+            print("[CHAT] Client requested end of session.")
+            break
+
+        parsed = parse_message(raw)
+        if not isinstance(parsed, Msg):
+            print(f"[CHAT] Ignoring non-msg type: {msg_type!r}")
+            continue
+
+        seqno = parsed.seqno
+        ts = parsed.ts
+        ct_b64 = parsed.ct
+        sig_b64 = parsed.sig
+
+        # Replay defense: seqno strictly increasing
+        if seqno <= last_seq:
+            print("[REPLAY] Non-increasing seqno, message discarded.")
+            continue
+        last_seq = seqno
+
+        # Signature verification
+        data_bytes = build_msg_bytes(seqno, ts, ct_b64)
+        sig_bytes = b64d(sig_b64)
+
+        if not rsa_verify(client_cert, data_bytes, sig_bytes):
+            print("[SIG] Invalid signature, message discarded.")
+            continue
+
+        # Decrypt ciphertext
+        ct = b64d(ct_b64)
+        pt = aes_decrypt_ecb(session_key, ct)
+        try:
+            plaintext = pt.decode("utf-8")
+        except UnicodeDecodeError:
+            plaintext = pt.decode("utf-8", errors="replace")
+
+        # Log and display
+        transcript.append("in", parsed.dict(by_alias=True))
+        print(f"[MSG {seqno}] {plaintext}")
+
+
+# ---------------------------------------------------------------------------
 # Per-connection handler
 # ---------------------------------------------------------------------------
 
 
 def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
     """
-    Handle a single client connection up to the point where:
+    Handle a single client connection:
 
-      - Certificates have been exchanged and validated.
-      - Credentials have been protected with DH #1 + AES-128.
-      - Optional: user has either registered or logged in.
-      - A second DH for chat session key has completed.
-
-    Then we close the connection (no data-plane chat in this skeleton).
+      - Certificates exchanged and validated.
+      - Credentials protected with DH #1 + AES-128 (register or login).
+      - If login succeeds, DH #2 for K_session.
+      - Chat loop: server receives encrypted+signed messages from client.
     """
     print(f"[*] New connection from {addr}")
 
     try:
         # Phase 1: cert exchange + validation
-        do_cert_handshake(conn)
+        hello = do_cert_handshake(conn)
+        client_cert_pem = hello.client_cert
 
         # Phase 2: DH #1 -> K_cred (for credentials)
+        print("[PHASE] DH #1 (credentials)...")
         k_cred = dh_handshake_server(conn)
 
         # Phase 3: encrypted register OR login over K_cred
@@ -288,19 +374,19 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
 
         if msg_type == "register":
             handle_register_message(conn, k_cred, first)
-            # For this skeleton, we close after registration.
+            # Skeleton: close after registration
             return
 
         if msg_type == "login":
             ok = handle_login_message(conn, k_cred, first)
             if not ok:
-                return  # close connection on failed login
+                return
 
-            # If login succeeded, we now perform a second DH for chat session.
-            print("[DH] Starting DH #2 for chat session key...")
+            # If login succeeded, we now perform DH #2 for chat session.
+            print("[PHASE] DH #2 (chat session)...")
             k_session = dh_handshake_server(conn)
-            print("[DH] Session AES key established. (Skeleton ends here.)")
-            # In a full implementation, you'd now enter a chat loop using k_session.
+            print("[INFO] Session AES key established. Entering chat loop...")
+            chat_loop_server(conn, k_session, client_cert_pem)
             return
 
         # Unexpected type
@@ -320,7 +406,7 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SecureChat Server (practice skeleton)")
+    parser = argparse.ArgumentParser(description="SecureChat Server (practice, with chat receive)")
     parser.add_argument("--host", default=SERVER_HOST, help="Bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=SERVER_PORT, help="Bind port (default 5000)")
     args = parser.parse_args()
@@ -333,7 +419,7 @@ def main() -> None:
 
         while True:
             conn, addr = s.accept()
-            # For simplicity: one client at a time, no threads.
+            # Simple single-threaded server
             handle_client(conn, addr)
 
 
